@@ -32,7 +32,9 @@ sensor_names = ['T2', # total temperature at fan inlet
 # options to visualize the datadrame
 col_names =  index_names + operational_condition_names + sensor_names
 
-df_train = pd.read_csv(r'C:\Users\joche\OneDrive\Documenten\Master FPP\MMA (Maintenance Modelling & Analysis)\Assignment\6. Turbofan Engine Degradation Simulation Data Set\train_FD001.txt' ,  sep = ' ' , names=col_names, index_col = False,  usecols=range(len(col_names))) 
+df_train = pd.read_csv(r'train_FD001.txt' ,  sep = ' ' , names=col_names, index_col = False,  usecols=range(len(col_names))) 
+
+#C:\Users\joche\OneDrive\Documenten\Master FPP\MMA (Maintenance Modelling & Analysis)\Assignment\6. Turbofan Engine Degradation Simulation Data Set\
 
 # Extracting the 0th ('engine') and 1st ('cycle') columns:
 engine_cycle_data = df_train[['engine', 'cycle']]
