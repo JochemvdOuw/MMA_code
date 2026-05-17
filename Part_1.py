@@ -1,6 +1,8 @@
-
 import pandas as pd
-
+import numpy as np
+import matplotlib.pyplot as plt
+from reliability.Fitters import Fit_Everything, Loglogistic_Distribution
+from reliability.Distributions import Loglogistic_Distribution
 
 
 cp = 1e4
@@ -34,77 +36,57 @@ col_names =  index_names + operational_condition_names + sensor_names
 
 df_train = pd.read_csv(r'train_FD001.txt' ,  sep = ' ' , names=col_names, index_col = False,  usecols=range(len(col_names))) 
 
-#C:\Users\joche\OneDrive\Documenten\Master FPP\MMA (Maintenance Modelling & Analysis)\Assignment\6. Turbofan Engine Degradation Simulation Data Set\
 
 # Extracting the 0th ('engine') and 1st ('cycle') columns:
 engine_cycle_data = df_train[['engine', 'cycle']]
 
-# To get "how many flight cycles it has been used" before failure for Part 1:
-# We group by the engine unit and extract the maximum cycle value.
-lifetimes = df_train.groupby('engine')['cycle'].max().values
-
-print(engine_cycle_data)
-print(lifetimes)
+# Extract Time-to-Failure (maximum cycles per engine)
+lifetimes = list(df_train.groupby('engine')['cycle'].max().values.astype(float))
 
 
+# =========================================================
+# BULLET 1: FITTING DISTRIBUTIONS
+# =========================================================
+print("--- 1. Fitting All Distributions ---")
 
 
+distributions_to_exclude = [
+    'Exponential_1P',
+    'Exponential_2P',
+    'Weibull_CR',
+    'Weibull_2P',
+    'Weibull_DS',
+    'Gumbel_2P',
+
+    'Lognormal_2P',
+    'Lognormal_3P',
+    'Normal_2P',
+    'Gamma_2P',
+    'Gamma_3P',
+    'Weibull_Mixture',
+    'Weibull_3P',
+    'loglogistic_3P'
+]
+
+fit_results = Fit_Everything(
+    failures=lifetimes, 
+    exclude=distributions_to_exclude, 
+    show_histogram_plot=True,
+    show_probability_plot=True, 
+    show_PP_plot=True,
+    show_best_distribution_probability_plot=True
+)
 
 
+# Apply title to the canvas Fit_Everything just created
+#plt.title("Fitted Probability Distributions on Engine Lifetimes")
+#plt.savefig('Distribution_Fits.png', dpi=300, bbox_inches='tight')
+#plt.show(block=True) 
 
-from reliability.Fitters import Fit_Weibull_2P, Fit_Lognormal_2P
-import matplotlib.pyplot as plt
-
-# Precondition: 'lifetimes' is a 1-dimensional array of positive numerical values.
-
-# Fit a 2-Parameter Weibull distribution
-weibull_model = Fit_Weibull_2P(failures=lifetimes, show_probability_plot=True)
-
-# Fit a 2-Parameter Lognormal distribution
-lognormal_model = Fit_Lognormal_2P(failures=lifetimes, show_probability_plot=True)
-
-plt.show()
-
-# Access the optimized parameters mathematically
-print("Weibull Shape (Beta):", weibull_model.beta)
-print("Weibull Scale (Alpha):", weibull_model.alpha)
-
-
-
-
-
-
-from reliability.Fitters import Fit_Everything
-import matplotlib.pyplot as plt
-
-# Fit all available models to the failure data
-# The function automatically excludes distributions not applicable to the data range
-comprehensive_fit = Fit_Everything(failures=lifetimes)
-plt.show()
-
-# Extract the DataFrame ranking the distributions by best fit (lowest BIC)
-print(comprehensive_fit.results)
-
-
-
-
-
-
-
-from reliability.Distributions import Weibull_Distribution
-import matplotlib.pyplot as plt
-
-# Instantiate the mathematical object with known parameters
-dist = Weibull_Distribution(alpha=150, beta=2.5)
-
-# Calculate the exact value of the Hazard Function at a specific cycle t
-t = 120
-hazard_value = dist.HF(t)
-print(f"Hazard rate at t={t}: {hazard_value}")
-
-# Visually extract the shape of the hazard function
-dist.plot()
-plt.show()
+# Print the Goodness of Fit table
+gof_table = fit_results.results[['AICc', 'BIC', 'AD']]
+print("\nGoodness-of-Fit Table:")
+print(gof_table)
 
 
 
@@ -113,37 +95,97 @@ plt.show()
 
 
 
+# =========================================================
+# BULLET 2: HAZARD FUNCTION OF BEST FIT (Loglogistic 2P)
+# =========================================================
+print("\n--- 2. Hazard Function Analysis ---")
+plt.close('all') # Wipe memory again before the next plot
 
-import pandas as pd
-import matplotlib.pyplot as plt
-from reliability.Fitters import Fit_Everything
+best_alpha = fit_results.Loglogistic_2P_alpha
+best_beta = fit_results.Loglogistic_2P_beta
 
-# 1. Define columns as done previously
-index_names = ['engine', 'cycle'] 
-operational_condition_names = ['altitude', 'mach_nr', 'TRA']
-sensor_names = ['T2', 'T24', 'T30', 'T50', 'P2', 'P15', 'P30', 'Nf', 'Nc', 'epr', 
-                'Ps30', 'phi', 'NRf', 'NRc', 'BPR', 'farB', 'htBleed', 'Nf_dmd', 
-                'PCNfR_dmd', 'W31', 'W32']
-col_names = index_names + operational_condition_names + sensor_names
+loglogistic_dist = Loglogistic_Distribution(alpha=best_alpha, beta=best_beta)
 
-# 2. Read the data
-df_train = pd.read_csv(
-    r'train_FD001.txt', # Make sure to use your local path here
-    sep='\s+', 
-    names=col_names, 
-    index_col=False
-) 
+# The reliability package will draw the Hazard Function directly
+# Create an array of time values (e.g., from cycle 1 to 350)
+t_values = np.linspace(1, 400, 500)
 
-# 3. Extract the maximum cycle for each engine (Time-to-failure)
-lifetimes = df_train.groupby('engine')['cycle'].max().values
+# Calculate the Hazard Function values explicitly using the mathematical object
+hf_values = loglogistic_dist.HF(t_values)
 
-# 4. Use the reliability package to fit all distributions
-# This will automatically print the ranked results (AIC/BIC) and plot the curves
-fit_results = Fit_Everything(failures=lifetimes, show_histogram=True)
+# Plot using standard matplotlib commands to bypass the internal library error
+plt.figure(figsize=(8, 5))
+plt.plot(t_values, hf_values, label=rf'Loglogistic_2P HF ($\alpha={best_alpha:.2f}$, $\beta={best_beta:.2f}$)')
+#plt.title("Hazard Function of the Fitted Loglogistic_2P Distribution")
+plt.xlabel("Engine Cycles")
+plt.ylabel("Hazard h(t)")
+plt.legend()
+plt.grid(True, alpha=0.3)
 
-# 5. Extract the rankings to a CSV if you want to include a table in your report
-results_table = fit_results.results
-results_table.to_csv('Distribution_Fits_Ranked.csv')
+# Save and display
+plt.savefig('Hazard_Function.png', dpi=300, bbox_inches='tight')
+plt.show(block=True)
 
-plt.title("Fitted Probability Distributions on Engine Lifetimes")
-plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+# BULLET 3: OPTIMAL MAINTENANCE TIME & COST
+# =========================================================
+print("\n--- 3. Optimal Preventive Maintenance Optimization ---")
+plt.close('all') # Wipe memory for the final custom plot
+
+cp = 1e4  
+cf = 1e5 
+t_array = np.arange(1, 400, 1)
+g_t_values = []
+
+
+for t in t_array:
+    # Cast numpy integer to native Python float to satisfy the package's type checker
+    t_val = float(t)
+    
+    R_t = loglogistic_dist.SF(t_val)
+    F_t = loglogistic_dist.CDF(t_val)
+    
+    # Calculate the expected cycle length up to time t
+    # Cast the numpy array to a standard Python list
+    t_integral = list(np.linspace(0, t_val, 500))
+    R_integral = loglogistic_dist.SF(t_integral)
+    
+    # Calculate the integral using numpy's trapezoidal rule
+    expected_length = np.trapezoid(R_integral, t_integral)
+    
+    # Cost formula
+    g_t = (cp * R_t + cf * F_t) / expected_length
+    g_t_values.append(g_t)
+
+g_t_values = np.array(g_t_values)
+optimal_idx = np.argmin(g_t_values)
+optimal_t = t_array[optimal_idx]
+min_cost = g_t_values[optimal_idx]
+
+print(f"Optimal Time (t*): {optimal_t} cycles")
+print(f"Minimum Cost g(t*): {min_cost:.2f} euros/cycle")
+
+# Manually draw the final cost plot
+plt.figure(figsize=(8, 5))
+plt.plot(t_array, g_t_values, label="Expected Cost g(t)")
+plt.axvline(optimal_t, color='red', linestyle='--', label=f'Optimal t* = {optimal_t}')
+plt.plot(optimal_t, min_cost, 'ro') 
+#plt.title("Long-Term Average Maintenance Cost vs. Replacement Interval")
+plt.xlabel("Engine Cycles")
+plt.ylabel("Expected Cost per Cycle (Euros)")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig('Cost_Optimization.png', dpi=300, bbox_inches='tight')
+plt.show(block=True)
