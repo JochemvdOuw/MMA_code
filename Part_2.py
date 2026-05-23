@@ -364,7 +364,7 @@ plt.show(block=False)
 #     100 held-out test engines.
 
 gkf = GroupKFold(n_splits=5)
-WINDOW_CANDIDATES = [30, 50, 75, 100, 125]
+WINDOW_CANDIDATES = [50, 75, 100]
 
 def cv_rmse_window(window, base_model):
     """GroupKFold RMSE for a given window + model (scaler+PCA fitted per fold)."""
