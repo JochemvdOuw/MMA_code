@@ -187,6 +187,12 @@ def make_rolling_features(df, sensors, window, min_periods=None):
             g.transform(lambda x: x.rolling(window, min_periods=min_periods).std().fillna(0))
              .rename(f'{s}_std').reset_index(drop=True)
         )
+        # EWM: weights recent cycles more heavily than older ones.
+        # ewm_{s,t} = (1−α)·ewm_{s,t−1} + α·x_{s,t},  α = 2/(span+1)
+        parts.append(
+            g.transform(lambda x: x.ewm(span=window, min_periods=1).mean())
+             .rename(f'{s}_ewm').reset_index(drop=True)
+        )
     result = pd.concat(parts, axis=1)
     if 'RUL' in df.columns:
         result['RUL'] = df['RUL'].reset_index(drop=True)
@@ -200,7 +206,7 @@ feat_test_last = feat_test_raw.groupby('engine').last().reset_index()
 
 feature_cols = [c for c in feat_train.columns if c not in ('engine', 'cycle', 'RUL')]
 print(f"\nFeature vector: {len(feature_cols)} features "
-      f"({len(top8_sensors)} sensors × 2 statistics: mean + std)")
+      f"({len(top8_sensors)} sensors × 3 statistics: mean + std + ewm)")
 
 # ----------------------------------------------------------
 # STEP 2 — Engine-level train / validation split
@@ -539,19 +545,25 @@ plt.show(block=True)
 # -------------------------------------------------------
 # 2.4.1  Comparison table (console)
 # -------------------------------------------------------
+# Ensemble: simple average of RF and XGBoost predictions.
+# Averaging two models with different biases reduces variance.
+rul_pred_ens = np.clip(0.5 * rul_pred_rf + 0.5 * rul_pred_xgb, 0, RUL_CAP)
+rmse_test_ens = float(np.sqrt(np.mean((rul_true - rul_pred_ens) ** 2)))
+
 mae_rf  = float(np.mean(np.abs(rul_true - rul_pred_rf)))
 mae_xgb = float(np.mean(np.abs(rul_true - rul_pred_xgb)))
+mae_ens = float(np.mean(np.abs(rul_true - rul_pred_ens)))
 
-print("\n" + "=" * 58)
-print(f"{'MODEL COMPARISON — TEST SET (100 engines)':^58}")
-print("=" * 58)
-print(f"{'Metric':<28} {'Random Forest':>14} {'XGBoost':>14}")
-print("-" * 58)
-print(f"{'Best window (cycles)':<28} {best_w_rf:>14} {best_w_xgb:>14}")
-print(f"{'Best CV RMSE (cycles)':<28} {-search_rf.best_score_:>14.2f} {-search_xgb.best_score_:>14.2f}")
-print(f"{'Test RMSE  (cycles)':<28} {rmse_test_rf:>14.2f} {rmse_test_xgb:>14.2f}")
-print(f"{'Test MAE   (cycles)':<28} {mae_rf:>14.2f} {mae_xgb:>14.2f}")
-print("=" * 58)
+print("\n" + "=" * 72)
+print(f"{'MODEL COMPARISON — TEST SET (100 engines)':^72}")
+print("=" * 72)
+print(f"{'Metric':<28} {'Random Forest':>14} {'XGBoost':>14} {'Ensemble':>14}")
+print("-" * 72)
+print(f"{'Best window (cycles)':<28} {best_w_rf:>14} {best_w_xgb:>14} {'(avg)':>14}")
+print(f"{'Best CV RMSE (cycles)':<28} {-search_rf.best_score_:>14.2f} {-search_xgb.best_score_:>14.2f} {'—':>14}")
+print(f"{'Test RMSE  (cycles)':<28} {rmse_test_rf:>14.2f} {rmse_test_xgb:>14.2f} {rmse_test_ens:>14.2f}")
+print(f"{'Test MAE   (cycles)':<28} {mae_rf:>14.2f} {mae_xgb:>14.2f} {mae_ens:>14.2f}")
+print("=" * 72)
 
 # -------------------------------------------------------
 # 2.4.2  Error histogram — distribution of per-engine errors
