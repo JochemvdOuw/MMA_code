@@ -321,12 +321,33 @@ plt.show(block=False)
 
 # ----------------------------------------------------------
 # STEP 7 — Feature importance (Random Forest)
+#
+#   The RF is trained on PCA components, so importances are
+#   per-component. We also back-project to original features:
+#     orig_importance_j = Σ_k |loading_kj| × PC_importance_k
+#   This shows which raw sensor statistics drive the model.
 # ----------------------------------------------------------
-importances = pd.Series(rf.feature_importances_, index=feature_cols).sort_values()
-fig, ax = plt.subplots(figsize=(7, 6))
-importances.plot.barh(ax=ax, color='steelblue')
-ax.set_xlabel('Mean decrease in impurity (normalised)')
-ax.set_title('Random Forest — Feature importance')
+n_comp = pca.n_components_
+comp_names = [f'PC{i+1}' for i in range(n_comp)]
+
+# Per-component importance
+comp_imp = pd.Series(rf.feature_importances_, index=comp_names).sort_values()
+
+# Back-projected importance in original feature space
+orig_imp = pd.Series(
+    np.abs(pca.components_).T @ rf.feature_importances_,
+    index=feature_cols
+).sort_values()
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+comp_imp.plot.barh(ax=axes[0], color='steelblue')
+axes[0].set_xlabel('Mean decrease in impurity')
+axes[0].set_title('Importance per PCA component')
+
+orig_imp.plot.barh(ax=axes[1], color='darkorange')
+axes[1].set_xlabel('Back-projected importance')
+axes[1].set_title('Importance per original feature')
+
 plt.tight_layout()
 plt.savefig('Feature_Importance.png', dpi=150)
 plt.show(block=False)
