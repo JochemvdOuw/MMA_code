@@ -150,6 +150,7 @@ print(f"\nSensors for modelling: {top8_sensors}")
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 from sklearn.model_selection import GroupShuffleSplit, GroupKFold, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.base import clone
@@ -242,7 +243,23 @@ X_va_s = scaler.transform(X_va)
 X_te_s = scaler.transform(feat_test_last[feature_cols].values)
 
 # ----------------------------------------------------------
-# STEP 4 — Model 1: Random Forest
+# STEP 4 — PCA dimensionality reduction
+#
+#   Correlated feature pairs (Nc–NRc r=0.96, T50–phi r=−0.82)
+#   hurt Random Forest's random feature subsampling: when two
+#   correlated features are both in the candidate pool, one
+#   split selection is effectively wasted. PCA produces
+#   orthogonal components so every candidate at a split carries
+#   independent information. Fit on training data only.
+# ----------------------------------------------------------
+pca = PCA(n_components=0.95, random_state=42)
+X_tr_p = pca.fit_transform(X_tr_s)
+X_va_p = pca.transform(X_va_s)
+X_te_p = pca.transform(X_te_s)
+print(f"PCA: retained {pca.n_components_} components (≥95% variance)\n")
+
+# ----------------------------------------------------------
+# STEP 5A — Model 1: Random Forest
 #
 #   Trains B decision trees, each on a bootstrap sample of
 #   the training data, with random feature subsets at each
@@ -255,8 +272,8 @@ X_te_s = scaler.transform(feat_test_last[feature_cols].values)
 # ----------------------------------------------------------
 rf = RandomForestRegressor(n_estimators=200, max_depth=10,
                             min_samples_leaf=5, random_state=42, n_jobs=-1)
-rf.fit(X_tr_s, y_tr)
-y_va_rf = np.clip(rf.predict(X_va_s), 0, RUL_CAP)
+rf.fit(X_tr_p, y_tr)
+y_va_rf = np.clip(rf.predict(X_va_p), 0, RUL_CAP)
 rmse_rf = float(np.sqrt(np.mean((y_va - y_va_rf) ** 2)))
 print(f"Random Forest  — Validation RMSE: {rmse_rf:.2f} cycles")
 
@@ -276,8 +293,8 @@ print(f"Random Forest  — Validation RMSE: {rmse_rf:.2f} cycles")
 xgb_model = XGBRegressor(n_estimators=300, max_depth=5, learning_rate=0.05,
                           subsample=0.8, reg_lambda=5, reg_alpha=0.1,
                           random_state=42, n_jobs=-1, verbosity=0)
-xgb_model.fit(X_tr_s, y_tr)
-y_va_xgb = np.clip(xgb_model.predict(X_va_s), 0, RUL_CAP)
+xgb_model.fit(X_tr_p, y_tr)
+y_va_xgb = np.clip(xgb_model.predict(X_va_p), 0, RUL_CAP)
 rmse_xgb = float(np.sqrt(np.mean((y_va - y_va_xgb) ** 2)))
 print(f"XGBoost        — Validation RMSE: {rmse_xgb:.2f} cycles")
 
@@ -303,17 +320,22 @@ plt.savefig('RUL_Validation.png', dpi=150, bbox_inches='tight')
 plt.show(block=False)
 
 # ----------------------------------------------------------
-# STEP 5 — Feature importance (Random Forest)
+# STEP 6 — Feature importance (Random Forest)
 #
-#   Impurity-based importance: average reduction in MSE across
-#   all splits in all trees, normalised to sum to 1.
-#   Shows which rolling-window statistics drive RUL predictions.
+#   RF importances are per PCA component. We back-project to
+#   the original feature space for interpretability:
+#     importance_j = Σ_k |loading_kj| × component_importance_k
 # ----------------------------------------------------------
-importances = pd.Series(rf.feature_importances_, index=feature_cols).sort_values()
+n_comp = pca.n_components_
+orig_imp = pd.Series(
+    np.abs(pca.components_).T @ rf.feature_importances_,
+    index=feature_cols
+).sort_values()
+
 fig, ax = plt.subplots(figsize=(8, 6))
-importances.plot.barh(ax=ax, color='steelblue')
-ax.set_xlabel('Mean decrease in impurity (normalised)')
-ax.set_title('Random Forest — Feature importance (rolling features)')
+orig_imp.plot.barh(ax=ax, color='steelblue')
+ax.set_xlabel('Back-projected importance (via PCA loadings)')
+ax.set_title('Random Forest — Feature importance')
 plt.tight_layout()
 plt.savefig('Feature_Importance.png', dpi=150)
 plt.show(block=False)
@@ -333,19 +355,19 @@ plt.show(block=False)
 #   Stage B — Model hyperparameters
 #     With the best w fixed, RandomizedSearchCV + GroupKFold(5)
 #     searches the model-specific hyperparameter space.
-#     A sklearn Pipeline (StandardScaler → model) is used inside
-#     CV so the scaler is fit only on training folds — no
-#     information leaks from the held-out validation fold.
+#     A sklearn Pipeline (StandardScaler → PCA → model) is used
+#     inside CV so scaler and PCA are fit only on training folds —
+#     no information leaks from the held-out validation fold.
 #
 #   Final — Both models retrained on all 100 training engines
 #     with their best hyperparameters, then evaluated on the
 #     100 held-out test engines.
 
 gkf = GroupKFold(n_splits=5)
-WINDOW_CANDIDATES = [10, 20, 30, 40, 50]
+WINDOW_CANDIDATES = [10, 20, 30, 50, 75]
 
 def cv_rmse_window(window, base_model):
-    """GroupKFold RMSE for a given window + model (scaler fitted per fold)."""
+    """GroupKFold RMSE for a given window + model (scaler+PCA fitted per fold)."""
     feat = make_rolling_features(df_train, top8_sensors, window).dropna()
     fc   = [c for c in feat.columns if c not in ('engine', 'cycle', 'RUL')]
     X    = feat[fc].values
@@ -356,9 +378,12 @@ def cv_rmse_window(window, base_model):
         sc = StandardScaler()
         X_tr_s = sc.fit_transform(X[tr_i])
         X_va_s = sc.transform(X[va_i])
+        pc = PCA(n_components=0.95, random_state=42)
+        X_tr_p = pc.fit_transform(X_tr_s)
+        X_va_p = pc.transform(X_va_s)
         m = clone(base_model)
-        m.fit(X_tr_s, y[tr_i])
-        preds = np.clip(m.predict(X_va_s), 0, RUL_CAP)
+        m.fit(X_tr_p, y[tr_i])
+        preds = np.clip(m.predict(X_va_p), 0, RUL_CAP)
         rmses.append(float(np.sqrt(np.mean((y[va_i] - preds) ** 2))))
     return float(np.mean(rmses))
 
@@ -405,6 +430,7 @@ X_xgb_raw, y_xgb_all, grp_xgb, fc_xgb = get_raw_features(best_w_xgb)
 # --- RF pipeline search ---
 pipe_rf = Pipeline([
     ('scaler', StandardScaler()),
+    ('pca',    PCA(n_components=0.95, random_state=42)),
     ('model',  RandomForestRegressor(random_state=42, n_jobs=-1)),
 ])
 param_rf = {
@@ -426,6 +452,7 @@ print(f"RF  best params  : {search_rf.best_params_}")
 # --- XGB pipeline search ---
 pipe_xgb = Pipeline([
     ('scaler', StandardScaler()),
+    ('pca',    PCA(n_components=0.95, random_state=42)),
     ('model',  XGBRegressor(random_state=42, n_jobs=-1, verbosity=0)),
 ])
 param_xgb = {
