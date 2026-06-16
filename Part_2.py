@@ -6,8 +6,6 @@ import seaborn as sns
 # =========================================================
 # DATA LOADING
 # =========================================================
-# NOTE: Do NOT use engine number or cycle number as model input features.
-# They are only needed here to compute RUL labels.
 
 index_names = ['engine', 'cycle']
 operational_condition_names = ['altitude', 'mach_nr', 'TRA']
@@ -156,23 +154,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.base import clone
 from xgboost import XGBRegressor
 
-# ----------------------------------------------------------
-# STEP 1 — Rolling-window feature engineering
-#
-#   Raw sensor readings contain noise. We summarise the last
-#   W cycles of each sensor into two statistics per row t:
-#
-#     μ_{s,t} = (1/W) Σ_{k=t-W+1}^{t}  x_{s,k}   (rolling mean)
-#     σ_{s,t} = std of the same W observations       (rolling std)
-#
-#   Feature vector for one row:
-#     f_t = [ μ_{s1,t}, σ_{s1,t}, …, μ_{s8,t}, σ_{s8,t} ]  ∈ ℝ^{16}
-#
-#   Train: rows where < W preceding observations exist are
-#          dropped via dropna (no partial windows in training).
-#   Test : min_periods=1 — the last row per engine is used
-#          regardless of sequence length.
-# ----------------------------------------------------------
+# STEP 1 — rolling mean, std, and EWM per sensor over the last W cycles
 def make_rolling_features(df, sensors, window, min_periods=None):
     if min_periods is None:
         min_periods = window
@@ -187,8 +169,7 @@ def make_rolling_features(df, sensors, window, min_periods=None):
             g.transform(lambda x: x.rolling(window, min_periods=min_periods).std().fillna(0))
              .rename(f'{s}_std').reset_index(drop=True)
         )
-        # EWM: weights recent cycles more heavily than older ones.
-        # ewm_{s,t} = (1−α)·ewm_{s,t−1} + α·x_{s,t},  α = 2/(span+1)
+        # EWM: weights recent cycles more heavily (α = 2/(span+1))
         parts.append(
             g.transform(lambda x: x.ewm(span=window, min_periods=1).mean())
              .rename(f'{s}_ewm').reset_index(drop=True)
@@ -208,19 +189,7 @@ feature_cols = [c for c in feat_train.columns if c not in ('engine', 'cycle', 'R
 print(f"\nFeature vector: {len(feature_cols)} features "
       f"({len(top8_sensors)} sensors × 3 statistics: mean + std + ewm)")
 
-# ----------------------------------------------------------
-# STEP 2 — Engine-level train / validation split
-#
-#   We split by ENGINE ID, not by row. This prevents leakage:
-#   if rows from the same engine appeared in both sets, the
-#   model could learn engine-specific offsets and report an
-#   overoptimistic RMSE.
-#
-#   GroupShuffleSplit guarantees every engine ends up entirely
-#   in either train or val — never both.
-#
-#     100 training engines  →  80 train  |  20 validation
-# ----------------------------------------------------------
+# STEP 2 — split by engine ID so no engine appears in both train and val
 gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
 tr_idx, va_idx = next(gss.split(feat_train, groups=feat_train['engine']))
 
@@ -234,33 +203,13 @@ n_va_eng = feat_train.iloc[va_idx]['engine'].nunique()
 print(f"Train : {len(X_tr):,} rows ({n_tr_eng} engines)  |  "
       f"Val: {len(X_va):,} rows ({n_va_eng} engines)")
 
-# ----------------------------------------------------------
-# STEP 3 — Z-score normalisation
-#
-#   x̂_j = (x_j − μ_j) / σ_j
-#
-#   μ_j and σ_j are estimated from TRAINING rows only.
-#   The same fitted scaler is applied to val and test to
-#   prevent any information from those sets leaking in.
-# ----------------------------------------------------------
+# STEP 3 — z-score normalisation, scaler fit on training rows only
 scaler = StandardScaler()
 X_tr_s = scaler.fit_transform(X_tr)
 X_va_s = scaler.transform(X_va)
 X_te_s = scaler.transform(feat_test_last[feature_cols].values)
 
-# ----------------------------------------------------------
-# STEP 4 — Feature selection (SelectFromModel)
-#
-#   A fast ExtraTreesRegressor is fit on the training fold to
-#   score each of the 16 rolling features by impurity-based
-#   importance. Features above the median importance are kept;
-#   the rest are dropped. This:
-#     • removes redundant features (correlated pairs like
-#       Nc/NRc or T50/phi get only one representative kept)
-#     • preserves original feature names → fully interpretable
-#       importance plots without any back-projection
-#   Fit on training data only to prevent leakage.
-# ----------------------------------------------------------
+# STEP 4 — drop features below median ExtraTrees importance
 selector = SelectFromModel(
     ExtraTreesRegressor(n_estimators=100, random_state=42, n_jobs=-1),
     threshold='median'
@@ -272,18 +221,7 @@ X_te_sel = selector.transform(X_te_s)
 selected_features = [f for f, keep in zip(feature_cols, selector.get_support()) if keep]
 print(f"Features selected ({len(selected_features)}): {selected_features}\n")
 
-# ----------------------------------------------------------
-# STEP 5A — Model 1: Random Forest
-#
-#   Trains B decision trees, each on a bootstrap sample of
-#   the training data, with random feature subsets at each
-#   split (reduces correlation between trees):
-#
-#     ŷ_RF(f) = (1/B) Σ_{b=1}^{B} T_b(f)
-#
-#   Overfitting is controlled by max_depth and
-#   min_samples_leaf (minimum leaf size).
-# ----------------------------------------------------------
+# STEP 5A — Random Forest
 rf = RandomForestRegressor(n_estimators=200, max_depth=10,
                             min_samples_leaf=5, random_state=42, n_jobs=-1)
 rf.fit(X_tr_sel, y_tr)
@@ -291,19 +229,7 @@ y_va_rf = np.clip(rf.predict(X_va_sel), 0, RUL_CAP)
 rmse_rf = float(np.sqrt(np.mean((y_va - y_va_rf) ** 2)))
 print(f"Random Forest  — Validation RMSE: {rmse_rf:.2f} cycles")
 
-# ----------------------------------------------------------
-# STEP 4B — Model 2: XGBoost (Gradient Boosted Trees)
-#
-#   Sequentially adds M trees, each fitting the negative
-#   gradient (pseudo-residuals) of the MSE loss:
-#
-#     F_M(f) = Σ_{m=1}^{M} η · h_m(f)
-#
-#   η = learning rate.  Overfitting is limited by tree depth,
-#   row/column subsampling, and L1/L2 regularisation on leaf
-#   weights (reg_alpha / reg_lambda).
-#   (Hyperparameters refined in Section 2.3.)
-# ----------------------------------------------------------
+# STEP 5B — XGBoost (hyperparameters refined in §2.3)
 xgb_model = XGBRegressor(n_estimators=300, max_depth=5, learning_rate=0.05,
                           subsample=0.8, reg_lambda=5, reg_alpha=0.1,
                           random_state=42, n_jobs=-1, verbosity=0)
@@ -333,13 +259,7 @@ plt.tight_layout()
 plt.savefig('RUL_Validation.png', dpi=150, bbox_inches='tight')
 plt.show(block=False)
 
-# ----------------------------------------------------------
-# STEP 6 — Feature importance (Random Forest)
-#
-#   Because we used SelectFromModel, the RF sees only the
-#   selected features — importance maps directly to their names.
-#   No back-projection needed.
-# ----------------------------------------------------------
+# SelectFromModel keeps feature names intact, so importances map directly
 importances = pd.Series(rf.feature_importances_, index=selected_features).sort_values()
 fig, ax = plt.subplots(figsize=(8, 5))
 importances.plot.barh(ax=ax, color='steelblue')
@@ -353,24 +273,9 @@ plt.show(block=False)
 # =========================================================
 # SECTION 2.3 — HYPERPARAMETER TUNING  (GroupKFold CV)
 # =========================================================
-#
-# We tune in two stages:
-#
-#   Stage A — Rolling window size w
-#     Evaluated for w ∈ {10, 20, 30, 40, 50} using GroupKFold
-#     CV (5 folds × ~20 engines each) with a lightweight model.
-#     Done independently for RF and XGBoost.
-#
-#   Stage B — Model hyperparameters
-#     With the best w fixed, RandomizedSearchCV + GroupKFold(5)
-#     searches the model-specific hyperparameter space.
-#     A sklearn Pipeline (StandardScaler → SelectFromModel → model)
-#     is used inside CV so scaler and selector are fit only on
-#     training folds — no leakage from the validation fold.
-#
-#   Final — Both models retrained on all 100 training engines
-#     with their best hyperparameters, then evaluated on the
-#     100 held-out test engines.
+# Stage A: grid search over window size w (GroupKFold, 5 folds).
+# Stage B: RandomizedSearchCV over model params, Pipeline ensures no fold leakage.
+# Final:   both models retrained on all 100 engines, evaluated on test set.
 
 gkf = GroupKFold(n_splits=5)
 WINDOW_CANDIDATES = [50, 75, 100]
@@ -423,10 +328,6 @@ print(f"  Best window XGB: {best_w_xgb} cycles\n")
 
 # -------------------------------------------------------
 # Stage B: Model hyperparameter search
-#
-#   Pipeline(StandardScaler → model) inside CV ensures the
-#   scaler is fitted on each fold's training subset only —
-#   no information from the held-out validation fold leaks in.
 # -------------------------------------------------------
 print("=== Stage B: Model hyperparameter search ===")
 
@@ -490,10 +391,7 @@ print(f"\nXGB best CV RMSE : {-search_xgb.best_score_:.2f} cycles")
 print(f"XGB best params  : {search_xgb.best_params_}")
 
 # -------------------------------------------------------
-# Final: retrain on ALL 100 training engines, evaluate test
-#
-#   clone(best_estimator_) copies the pipeline with the best
-#   hyperparameters but unfits it, so we can refit on all data.
+# Final: refit best pipeline on all 100 training engines
 # -------------------------------------------------------
 print("\n=== Final models: retrain on all 100 engines ===")
 
@@ -545,8 +443,7 @@ plt.show(block=True)
 # -------------------------------------------------------
 # 2.4.1  Comparison table (console)
 # -------------------------------------------------------
-# Ensemble: simple average of RF and XGBoost predictions.
-# Averaging two models with different biases reduces variance.
+# simple average ensemble; blending the two models reduces variance
 rul_pred_ens = np.clip(0.5 * rul_pred_rf + 0.5 * rul_pred_xgb, 0, RUL_CAP)
 rmse_test_ens = float(np.sqrt(np.mean((rul_true - rul_pred_ens) ** 2)))
 
@@ -566,12 +463,7 @@ print(f"{'Test MAE   (cycles)':<28} {mae_rf:>14.2f} {mae_xgb:>14.2f} {mae_ens:>1
 print("=" * 72)
 
 # -------------------------------------------------------
-# 2.4.2  Error histogram — distribution of per-engine errors
-#
-#   For each test engine we have one true RUL and one predicted
-#   RUL. The signed error  e = ŷ - y  shows whether the model
-#   tends to over- or under-estimate. |e| ≤ 10 is excellent;
-#   |e| ≤ 20 meets the assignment target.
+# 2.4.2  Error histogram — signed error ŷ − y per engine
 # -------------------------------------------------------
 err_rf  = rul_pred_rf  - rul_true   # signed error (+ = overestimate)
 err_xgb = rul_pred_xgb - rul_true
@@ -597,11 +489,7 @@ plt.savefig('Error_Histogram.png', dpi=150, bbox_inches='tight')
 plt.show(block=False)
 
 # -------------------------------------------------------
-# 2.4.3  Absolute error vs true RUL
-#
-#   Reveals where in the RUL range the models struggle most.
-#   Engines near RUL = 125 are healthy and hard to predict;
-#   engines near RUL = 0 are close to failure and easier.
+# 2.4.3  Absolute error vs true RUL — where errors are largest
 # -------------------------------------------------------
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 for ax, err, label in zip(
